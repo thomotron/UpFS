@@ -1,4 +1,5 @@
 import re
+from datetime import datetime, date
 from errno import ENOENT, EROFS, ENOTSUP, EIO
 from stat import S_IFDIR, S_IFLNK, S_IFREG, S_IRUSR, S_IWUSR
 from sys import argv, exit
@@ -8,10 +9,7 @@ from upbankapi import Client, NotAuthorizedException, UpBankException
 from fuse import FUSE, FuseOSError, Operations
 
 class PathRegexes:
-    # monies = re.compile(r'^(-)?\$?(\d+)\.?(\d{0,2})$')
-    account = re.compile(r'^/([^/]+)/')
-    account_type = re.compile(r'^/([^/]+)/(spending|saver)$')
-    balance = re.compile(r'^/(?:([^/]+)/(balance)|(unallocated))/(?:\$?(\d+)\.?(\d{0,2}))?$')
+    account = re.compile(r'^/(?:([^/]+)/(balance|spending|saver)?)$')
     transactions = re.compile(r'^/([^/]+)/(?:(transactions)/(?:(\d{4})/(?:(\d{2})/(?:(\d{2})/(?:([^/]+)/(?:(amount|category|description|message|settled|status)|(tags)/([^/]+)?)?)?)?)?)?)$')
 
 class UpFuseOperations(Operations):
@@ -25,139 +23,6 @@ class UpFuseOperations(Operations):
 
     def __init__(self, client: Client):
         self.upapi = client
-        self.moneypool = MoneyPool()
-
-    def _total_unallocated(self):
-        return sum(self.moneypool.total())
-
-    def chmod(self, path, mode):
-        # chmod is useless to us
-        raise FuseOSError(EROFS)
-
-    def chown(self, path, uid, gid):
-        # chown is useless to us
-        raise FuseOSError(EROFS)
-
-    def link(self, target, source):
-        # ln is useless to us
-        raise FuseOSError(EROFS)
-
-    def mkdir(self, path, mode):
-        # mkdir is useless to us
-        raise FuseOSError(EROFS)
-
-    def mknod(self, path, mode, dev):
-        # mknod is useless to us
-        raise FuseOSError(EROFS)
-
-    def readlink(self, path):
-        # readlink is useless to us
-        raise FuseOSError(ENOENT)
-
-    def removexattr(self, path, name):
-        # removexattr is useless to us
-        raise FuseOSError(ENOTSUP)
-
-    def rename(self, old, new):
-        # rename is useless to us
-        raise FuseOSError(EROFS)
-
-    def rmdir(self, path):
-        # rmdir is useless to us
-        raise FuseOSError(EROFS)
-
-    def setxattr(self, path, name, value, options, position=0):
-        # setxattr is useless to us
-        raise FuseOSError(ENOTSUP)
-
-    def symlink(self, target, source):
-        # symlink is useless to us
-        raise FuseOSError(EROFS)
-
-    def truncate(self, path, length, fh=None):
-        # truncate is useless to us
-        raise FuseOSError(EROFS)
-
-    def unlink(self, path):
-        # unlink is useless to us
-        raise FuseOSError(EROFS)
-
-    def write(self, path, data, offset, fh):
-        # write is useless to us
-        raise FuseOSError(EROFS)
-
-    def create(self, path, mode, fi=None):
-        """
-        When raw_fi is False (default case), fi is None and create should
-        return a numerical file handle.
-        When raw_fi is True the file handle should be set directly by create
-        and return 0.
-        """
-
-        raise FuseOSError(EROFS)
-
-    def parse_path(self, path: str):
-        """
-        Parses the given path against the UpFS hierarchy.
-        :param path: Path to validate
-        :return: True if the path is within the hierarchy, otherwise False
-        """
-
-        # Match the path to the balance spec
-        match = PathRegexes.balance.match(path)
-        if not match:
-            # Doesn't match path spec
-            return False
-        elif match.group(3):
-            # Cannot add to unallocated
-            raise FuseOSError(EROFS)
-
-        # Extract the details from it
-        account_str = match.group(1)
-        dollars = float(match.group(4)) if match.group(4) else 0
-        cents = float(match.group(5)) if match.group(5) else 0
-        if not dollars and not cents:
-            # Cannot make the directory itself
-            raise FuseOSError(EROFS)
-        amount = dollars + (cents / 100)
-
-        # Parse the account
-        try:
-            account = self.upapi.account(account_str)
-        except UpBankException:
-            # Something went wrong getting the account
-            raise FuseOSError(EIO)
-
-        # Make sure the funds can be moved
-        if amount > self._total_unallocated():
-            # Can't credit funds - not enough available in the unallocated pool
-            raise FuseOSError(ENOTSUP)
-
-        # Move the funds
-        withdrawn_amounts = self.moneypool.withdraw(amount)
-        for account, amount in withdrawn_amounts:
-            # TODO: Move money around with the Up API once it can do that
-            pass
-
-        return 0
-
-    @staticmethod
-    def _parse_dollars_cents(dollars: str, cents: str):
-        """
-        Parses the given dollar and cent values as a single float value
-        :param dollars: Dollars
-        :param cents: Cents
-        :return: Float containing the total amount or None if neither value was provided
-        """
-
-        if not dollars and not cents:
-            # Be specific in returning None to indicate neither value was provided
-            return None
-        else:
-            # Convert and sum both values
-            dollars_f = float(dollars) if dollars else 0
-            cents_f = float(cents) if cents else 0
-            return dollars_f + (cents_f / 100)
 
     def getattr(self, path, fh=None):
         """
@@ -169,39 +34,50 @@ class UpFuseOperations(Operations):
         the directory, while Linux counts only the subdirectories.
         """
 
-        # TODO: Figure out a way to define path specs much like a web API endpoint
-        #       complete with path variables. Then find a way to check different path
-        #       specs (i.e. /unallocated/ vs /Spending/bal/
-        #       vs /Saver/transactions/2020/August/13/Oreo Cafe/)
-
-        # Match the path to the balance spec
-        match = PathRegexes.balance.match(path)
+        # Match the path to the account spec
+        match = PathRegexes.account.match(path)
         if match:
-            # Try parse the account and get the balance
-            account = None
-            balance = None
+            # Try parse the account
             if match.group(1):
                 try:
                     account = self.upapi.account(match.group(1))
-                    balance = account.balance
                 except UpBankException:
                     raise FuseOSError(EIO)
+
+            if not match.group(2):
+                # TODO: Root account dir
+                pass
+            elif match.group(2) == 'balance':
+                # TODO: Balance
+                balance = account.balance
+                pass
+            elif match.group(2) == 'spending':
+                # TODO: Spending flag
+                pass
+            elif match.group(2) == 'saver':
+                # TODO: Saver flag
+                pass
             else:
-                balance = self.moneypool.total()
-
-            # Double-check that this is the current balance, otherwise throw a not found error
-            if self._parse_dollars_cents(match.group(4), match.group(5)) != balance:
-                # Balance doesn't match, so technically this file can't exist
+                # Invalid path
                 raise FuseOSError(ENOENT)
-
-            return 0
 
         # Match the path to the transaction spec
         match = PathRegexes.transactions.match(path)
         if match:
             # Try parse the transaction details
-            # TODO: The above
-            transaction_str = None
+            account_str = match.group(1)
+            if not match.group(2):
+                # No 'transactions' in the path, something has gone horribly wrong
+                raise FuseOSError(EIO)
+            year = match.group(3)
+            month = match.group(4)
+            day = match.group(5)
+            payee = match.group(6)
+            detail = match.group(7)
+            if match.group(8):
+                # Tags
+                detail = 'tags'
+                tag = match.group(9)
 
             # Try parse the account and get the transaction
             try:
@@ -210,40 +86,63 @@ class UpFuseOperations(Operations):
             except UpBankException:
                 raise FuseOSError(EIO)
 
-            # Iterate over all the transactions in this account to find this one
-            transaction = None
-            while page and not transaction:
-                for _transaction in page:
-                    if _transaction.id == transaction_str:
-                        transaction = _transaction
-                        break
+            # Make sure we have the whole path before trying to get the transaction
+            if year and month and day and payee:
+                # Iterate over all the transactions in this account to find this one
+                transaction = None
+                while page and not transaction:
+                    for _transaction in page:
+                        if _transaction.id == payee and _transaction.created_at.date() == date(int(year), int(month), int(day)):
+                            transaction = _transaction
+                            break
 
-                # Be safe when getting the next page
-                try:
-                    page = page.next()
-                except UpBankException:
-                    raise FuseOSError(EIO)
+                    # Be safe when getting the next page
+                    try:
+                        page = page.next()
+                    except UpBankException:
+                        raise FuseOSError(EIO)
 
-        # TODO: Rest of the regex matching
+                if not transaction:
+                    # Couldn't find the transaction, report file not found
+                    raise FuseOSError(ENOENT)
 
-        return dict(
-            st_mode=(S_IFREG | S_IRUSR | S_IWUSR),
-            st_nlink=1,
-            st_size=0,
-            st_ctime=,
-            st_mtime=time(),
-            st_atime=time()
-        )
-
-        if path != '/':
-            raise FuseOSError(ENOENT)
-        return dict(st_mode=(S_IFDIR | 0o755), st_nlink=2)
-
-    def getxattr(self, path, name, position=0):
-        raise FuseOSError(ENOTSUP)
-
-    def listxattr(self, path):
-        return []
+                if detail:
+                    if detail == 'tags':
+                        # TODO: Tags
+                        pass
+                    elif detail == 'amount':
+                        # TODO: Amount
+                        pass
+                    elif detail == 'category':
+                        # TODO: Category
+                        pass
+                    elif detail == 'description':
+                        # TODO: Description
+                        pass
+                    elif detail == 'message':
+                        # TODO: Message
+                        pass
+                    elif detail == 'settled':
+                        # TODO: Settled
+                        pass
+                    elif detail == 'status':
+                        # TODO: Status
+                        pass
+                    else:
+                        # Not a valid detail
+                        raise FuseOSError(ENOENT)
+            elif year and month and day:
+                # TODO: Get the transactions at this date
+                pass
+            elif year and month:
+                # TODO: Get the days in this month with a transaction
+                pass
+            elif year:
+                # TODO: Get the months in this year with a transaction
+                pass
+            else:
+                # TODO: Get the years with a transaction
+                pass
 
     def open(self, path, flags):
         """
@@ -264,7 +163,8 @@ class UpFuseOperations(Operations):
     def read(self, path, size, offset, fh):
         """Returns a string containing the data requested."""
 
-        raise FuseOSError(EIO)
+        # TODO: Validate the file path and return the data
+        pass
 
     def readdir(self, path, fh):
         """
@@ -272,13 +172,8 @@ class UpFuseOperations(Operations):
         tuples. attrs is a dict as in getattr.
         """
 
+        # TODO: Validate the file path and return a list of the contents
         return ['.', '..']
-
-    def release(self, path, fh):
-        return 0
-
-    def releasedir(self, path, fh):
-        return 0
 
     def statfs(self, path):
         """
@@ -295,64 +190,25 @@ class UpFuseOperations(Operations):
 
         return 0
 
-
-class MoneyPool:
+class FileDescriptor:
     """
-    Utility class that tracks multiple accounts and treats their funds as a single pool to withdraw from.
+    Common class used to represent virtual 'files' within UpFS.
+    Contains all attributes and content that needs to be displayed to the operating system.
     """
+    # TODO: Get all the attributes needed and plug them in here
 
-    def __init__(self):
-        self._accounts = dict()
-
-    def total(self):
-        """
-        Returns the total funds across all accounts.
-        """
-        return sum(self._accounts.values())
-
-    def totals(self):
-        """
-        Returns a dict the total funds for each account.
-        """
-        return dict(self._accounts)
-
-    def deposit(self, account, amount):
-        """
-        Makes a deposit to the given account with the given amount.
-        :param account: Account to deposit into
-        :param amount: Amount to deposit
-        """
-        if not self._accounts[account]:
-            self._accounts[account] = amount
-        else:
-            self._accounts[account] = self._accounts[account] + amount
-
-    def withdraw(self, amount):
-        """
-        Withdraws the given amount from the pool.
-        This will empty accounts sequentially until the withdrawal is completed.
-        :param amount: Amount to withdraw
-        :return: Dict containing each account and the amount withdrawn from them
-        """
-        withdrawn_amounts = dict()
-
-        # Make sure the funds are available
-        if self.total() < amount:
-            return withdrawn_amounts
-
-        for account, balance in self._accounts.items():
-            # Stop guzzling funds if we have taken what we need
-            if amount == 0:
-                break
-
-            # Withdraw the maximum we can from this account
-            self._accounts[account] = max(balance - amount, 0)
-            withdrawn_amounts[account] = max(min(0, balance - (balance - amount)), balance)
-
-            # and take a chunk out of the amount left
-            amount = amount - (balance - amount)
-
-        return withdrawn_amounts
+    def __init__(self, path: str):
+        self.path = path
+        self.attributes = dict(
+            st_mode=None,
+            st_nlink=None,
+            st_size=None,
+            st_ctime=None,
+            st_mtime=None,
+            st_atime=None
+        )
+        self.content = None
+        self.is_dir = path.endswith('/')
 
 
 if __name__ == '__main__':
